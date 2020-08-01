@@ -18,14 +18,7 @@
     Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
-#include <assert.h>
-#include <fcntl.h>
 #include <gtk/gtk.h>
-#include <math.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 
 #include "deadbeef.h"
 #include "fastftoi.h"
@@ -39,8 +32,24 @@ static DB_misc_t plugin;
 static DB_functions_t *deadbeef    = NULL;
 static gboolean scan_start_blocked = FALSE;
 static gboolean scan_end_blocked   = FALSE;
+static gboolean plugin_enabled     = FALSE;
 static int channels;
-static intptr_t mutex;
+static intptr_t mutex              = 0;
+static float dB_Threshold_Value_Start;
+static float dB_Threshold_Value_Middle;
+static float dB_Threshold_Value_End;
+
+
+
+static void load_config(){
+    dB_Threshold_Value_Start  = deadbeef->conf_get_int ("silence_remover.dB_start", 10);
+    dB_Threshold_Value_Middle = deadbeef->conf_get_int ("silence_remover.dB_middle", 0);
+    dB_Threshold_Value_End    = deadbeef->conf_get_int ("silence_remover.dB_end",   35);
+
+    plugin_enabled = !(dB_Threshold_Value_Start == -1 && dB_Threshold_Value_Middle == -1 && dB_Threshold_Value_End == -1);
+
+    //printf( "++ config reloaded: dB-start: %f    dB-middle: %f     dB-end: %f   enabled: %i \n",  dB_Threshold_Value_Start, dB_Threshold_Value_Middle, dB_Threshold_Value_End, plugin_enabled );
+}
 
 
 static void silenceremover_wavedata_listener( void *ctx, ddb_audio_data_t *data )
@@ -59,52 +68,79 @@ static void silenceremover_wavedata_listener( void *ctx, ddb_audio_data_t *data 
             float amplitude = data->data[ftoi( s * data->fmt->channels ) + channel];
             sum += amplitude * amplitude;
         }
-        middle += ( sqrt( sum / nsamples ) ) / 2;
+        middle += ( sqrt( sum / nsamples ) );
     }
 
+    middle /= channels;
+    float dB = 100 + (20.0 * log10f (middle)); // 100 = DB_RANGE
 
-    DB_playItem_t *it = deadbeef->streamer_get_playing_track();
-    // float length      = deadbeef->pl_get_item_duration( it );
-    // float pos         = deadbeef->streamer_get_playpos();
+
+    //printf( "dB: %f / start_dB: %f    middle_dB: %f     end_dB: %f \n", dB, dB_Threshold_Value_Start, dB_Threshold_Value_Middle, dB_Threshold_Value_End );
+
+    //DB_playItem_t *it = deadbeef->streamer_get_playing_track();
+    //float length      = deadbeef->pl_get_item_duration( it );
+    //float pos         = deadbeef->streamer_get_playpos();
+    //deadbeef->pl_item_unref( it );
+
     float percent     = deadbeef->playback_get_pos();
 
-    if ( middle > 0.001500 ) scan_start_blocked = TRUE;
+    if ( dB > dB_Threshold_Value_Start ) scan_start_blocked = TRUE;
 
     // Fast forward from the beginning until reaching of the threshold value
-    if ( !scan_start_blocked && percent < 10.0 )
+    if ( dB_Threshold_Value_Start >= 0 && !scan_start_blocked && percent < 10.0 )
     {
-        deadbeef->playback_set_pos( percent + 0.5 );
-        // printf( "++ Fast forward from the beginning: Amplitude: %f / percent played: %f / play pos: %f / song length: %f\n", middle, percent, pos, length );
+        deadbeef->playback_set_pos( percent + 0.1 );
+        //printf( "++ Fast forward from the beginning: dB: %f / percent played: %f / play pos: %f / song length: %f\n", dB, percent, pos, length );
     }
     // If the music gets too quiet towards the end of the song we jump to the next song
-    else if ( !scan_end_blocked && middle <= 0.001500 && percent > 90.0 )
+    else if ( dB_Threshold_Value_End >= 0 && !scan_end_blocked && dB <= dB_Threshold_Value_End && percent > 90.0 )
     {
-        deadbeef->sendmessage( DB_EV_NEXT, 0, 0, 0 );
+        // deadbeef->sendmessage( DB_EV_NEXT, 0, 0, 0 ); does not catch activated PLAYBACK_MODE_LOOP_SINGLE
+        int pl_loop_mode = deadbeef->conf_get_int ("playback.loop", 0);
+        if (pl_loop_mode == PLAYBACK_MODE_LOOP_SINGLE) { // song finished, loop mode is "loop 1 track"
+            deadbeef->sendmessage( DB_EV_PLAY_CURRENT, 0, 0, 0 );
+        } else {
+            deadbeef->sendmessage( DB_EV_NEXT, 0, 0, 0 );
+        }
+
         scan_end_blocked = TRUE;
-        // printf( "-> Next song (%f seconds skipped): Amplitude: %f / percent played: %f / play pos: %f / song length: %f\n\n", length - pos, middle, percent, pos, length );
+        //printf( "-> Next song (%f seconds skipped): dB: %f / percent played: %f / play pos: %f / song length: %f\n\n", length - pos, dB, percent, pos, length );
     }
     // Skip very quiet places in the middle part of the song
-    else if ( middle < 0.000100 && percent >= 10.0 && percent <= 90.0 )
+    else if ( dB_Threshold_Value_Middle >= 0 && dB <= dB_Threshold_Value_Middle && percent >= 10.0 && percent <= 90.0 )
     {
-        deadbeef->playback_set_pos( percent + 0.5 );
-        // printf( "++ Fast forward: Amplitude: %f / percent played: %f / play pos: %f / song length: %f\n", middle, percent, pos, length );
+        deadbeef->playback_set_pos( percent + 0.1 );
+        //printf( "++ Fast forward: dB: %f / percent played: %f / play pos: %f / song length: %f\n", dB, percent, pos, length );
     }
 
-    deadbeef->pl_item_unref( it );
     deadbeef->mutex_unlock( mutex );
 }
 
-int silenceremover_connect( void )
+static int silenceremover_connect( void )
 {
-    mutex = deadbeef->mutex_create();
+    if (mutex == 0) mutex = deadbeef->mutex_create();
     deadbeef->vis_waveform_listen( NULL, silenceremover_wavedata_listener );
 
     return 0;
 }
 
-int silenceremover_start( void ) { return 0; }
 
-int silenceremover_stop( void ) { return 0; }
+static int silenceremover_disconnect( void )
+{
+    deadbeef->vis_waveform_unlisten( NULL );
+
+    return 0;
+}
+
+
+
+static int silenceremover_start( void ) {
+    load_config();
+
+    return 0;
+}
+
+static int silenceremover_stop( void ) { return 0; }
 
 static int handle_event( uint32_t current_event, uintptr_t ctx, uint32_t p1, uint32_t p2 )
 {
@@ -114,9 +150,18 @@ static int handle_event( uint32_t current_event, uintptr_t ctx, uint32_t p1, uin
         scan_start_blocked = FALSE;
         scan_end_blocked   = FALSE;
     }
+    else if ( current_event == DB_EV_CONFIGCHANGED){
+        load_config();
+
+        if (plugin_enabled) silenceremover_connect();
+        else silenceremover_disconnect();
+
+    }
 
     return 0;
 }
+
+
 
 static DB_misc_t plugin = {
     .plugin.type          = DB_PLUGIN_MISC,
@@ -127,7 +172,7 @@ static DB_misc_t plugin = {
     .plugin.id            = "silenceremover",
     .plugin.name          = "Silence Remover",
     .plugin.descr         = "The plugin automatically skips quiet areas of a song for gapless playback.",
-    .plugin.copyright     = "Copyright (C) 2019 kpcee\n"
+    .plugin.copyright     = "Copyright (C) 2020 kpcee\n"
                         "\n"
                         "This program is free software; you can redistribute it and/or\n"
                         "modify it under the terms of the GNU General Public License\n"
@@ -142,13 +187,17 @@ static DB_misc_t plugin = {
                         "You should have received a copy of the GNU General Public License\n"
                         "along with this program; if not, write to the Free Software\n"
                         "Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.\n",
-    .plugin.website    = "https://github.com/kpcee/deadbeef-silence_remover",
-    .plugin.start      = silenceremover_start,
-    .plugin.stop       = silenceremover_stop,
-    .plugin.connect    = silenceremover_connect,
-    .plugin.disconnect = NULL,
-    .plugin.message    = handle_event,
+    .plugin.website      = "https://github.com/kpcee/deadbeef-silence_remover",
+    .plugin.start        = silenceremover_start,
+    .plugin.stop         = silenceremover_stop,
+    .plugin.connect      = silenceremover_connect,
+    .plugin.disconnect   = NULL,
+    .plugin.message      = handle_event,
+    .plugin.configdialog = "property \"Skip parts on the beginning less or equal as x dB (-1 to deactivate) \" spinbtn[-1,100,1] silence_remover.dB_start 10 ; \n"
+                           "property \"Skip middle parts less or equal as x dB (-1 to deactivate) \" spinbtn[-1,100,1] silence_remover.dB_middle 0 ;\n"
+                           "property \"Skip parts on the end less or equal as x dB (-1 to deactivate) \" spinbtn[-1,100,1] silence_remover.dB_end 35 ;\n"
 };
+
 
 DB_plugin_t *silence_remover_load( DB_functions_t *ddb )
 {
