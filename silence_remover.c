@@ -19,7 +19,6 @@
 */
 
 #include <gtk/gtk.h>
-
 #include "deadbeef.h"
 #include "fastftoi.h"
 
@@ -33,8 +32,8 @@ static DB_functions_t *deadbeef    = NULL;
 static gboolean scan_start_blocked = FALSE;
 static gboolean scan_end_blocked   = FALSE;
 static gboolean plugin_enabled     = FALSE;
-static int channels;
 static intptr_t mutex              = 0;
+static int pl_loop_mode            = 0;
 static float dB_Threshold_Value_Start;
 static float dB_Threshold_Value_Middle;
 static float dB_Threshold_Value_End;
@@ -45,8 +44,9 @@ static void load_config(){
     dB_Threshold_Value_Start  = deadbeef->conf_get_int ("silence_remover.dB_start", 10);
     dB_Threshold_Value_Middle = deadbeef->conf_get_int ("silence_remover.dB_middle", 0);
     dB_Threshold_Value_End    = deadbeef->conf_get_int ("silence_remover.dB_end",   35);
-
     plugin_enabled = !(dB_Threshold_Value_Start == -1 && dB_Threshold_Value_Middle == -1 && dB_Threshold_Value_End == -1);
+
+    pl_loop_mode = deadbeef->conf_get_int ("playback.loop", 0);
 
     //printf( "++ config reloaded: dB-start: %f    dB-middle: %f     dB-end: %f   enabled: %i \n",  dB_Threshold_Value_Start, dB_Threshold_Value_Middle, dB_Threshold_Value_End, plugin_enabled );
 }
@@ -54,10 +54,13 @@ static void load_config(){
 
 static void silenceremover_wavedata_listener( void *ctx, ddb_audio_data_t *data )
 {
-    float middle = 0;
+    float percent = deadbeef->playback_get_pos();
+    if (percent <= 0.0) return;
 
     deadbeef->mutex_lock( mutex );
-    channels     = MIN( MAX_CHANNELS, data->fmt->channels );
+
+    float result = 0;
+    int channels = MIN( MAX_CHANNELS, data->fmt->channels );
     int nsamples = data->nframes / channels;
 
     for ( int channel = 0; channel < channels; channel++ )
@@ -68,35 +71,33 @@ static void silenceremover_wavedata_listener( void *ctx, ddb_audio_data_t *data 
             float amplitude = data->data[ftoi( s * data->fmt->channels ) + channel];
             sum += amplitude * amplitude;
         }
-        middle += ( sqrt( sum / nsamples ) );
+        result += ( sqrt( sum / nsamples ) );
     }
 
-    middle /= channels;
-    float dB = 100 + (20.0 * log10f (middle)); // 100 = DB_RANGE
+    result /= channels;
+    float dB = 100 + ( 20.0 * log10f (result) ); // 100 = DB_RANGE
+  
+    // printf( "dB: %f / start_dB: %f    middle_dB: %f     end_dB: %f   percent played: %f\n", dB, dB_Threshold_Value_Start, dB_Threshold_Value_Middle, dB_Threshold_Value_End, percent );
 
-
-    //printf( "dB: %f / start_dB: %f    middle_dB: %f     end_dB: %f \n", dB, dB_Threshold_Value_Start, dB_Threshold_Value_Middle, dB_Threshold_Value_End );
-
-    //DB_playItem_t *it = deadbeef->streamer_get_playing_track();
+    //DB_playItem_t *it = deadbeef->streamer_get_playing_track_safe();
     //float length      = deadbeef->pl_get_item_duration( it );
     //float pos         = deadbeef->streamer_get_playpos();
     //deadbeef->pl_item_unref( it );
 
-    float percent     = deadbeef->playback_get_pos();
+
 
     if ( dB > dB_Threshold_Value_Start ) scan_start_blocked = TRUE;
 
     // Fast forward from the beginning until reaching of the threshold value
     if ( dB_Threshold_Value_Start >= 0 && !scan_start_blocked && percent < 10.0 )
     {
-        deadbeef->playback_set_pos( percent + 0.1 );
+        deadbeef->playback_set_pos( percent + 0.05 );
         //printf( "++ Fast forward from the beginning: dB: %f / percent played: %f / play pos: %f / song length: %f\n", dB, percent, pos, length );
     }
     // If the music gets too quiet towards the end of the song we jump to the next song
     else if ( dB_Threshold_Value_End >= 0 && !scan_end_blocked && dB <= dB_Threshold_Value_End && percent > 90.0 )
     {
         // deadbeef->sendmessage( DB_EV_NEXT, 0, 0, 0 ); does not catch activated PLAYBACK_MODE_LOOP_SINGLE
-        int pl_loop_mode = deadbeef->conf_get_int ("playback.loop", 0);
         if (pl_loop_mode == PLAYBACK_MODE_LOOP_SINGLE) { // song finished, loop mode is "loop 1 track"
             deadbeef->sendmessage( DB_EV_PLAY_CURRENT, 0, 0, 0 );
         } else {
@@ -150,7 +151,15 @@ static int handle_event( uint32_t current_event, uintptr_t ctx, uint32_t p1, uin
         scan_start_blocked = FALSE;
         scan_end_blocked   = FALSE;
     }
-    else if ( current_event == DB_EV_CONFIGCHANGED){
+
+    // Prevent songs from being skipped if DeaDBeeF switch to the next song itself 
+    else if ( current_event == DB_EV_SONGCHANGED || current_event == DB_EV_SONGFINISHED )
+    {
+        scan_start_blocked = TRUE;
+        scan_end_blocked   = TRUE;
+    }
+
+    else if ( current_event == DB_EV_CONFIGCHANGED ){
         load_config();
 
         if (plugin_enabled) silenceremover_connect();
