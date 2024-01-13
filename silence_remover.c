@@ -34,6 +34,7 @@ static gboolean scan_end_blocked   = FALSE;
 static gboolean plugin_enabled     = FALSE;
 static intptr_t mutex              = 0;
 static int pl_loop_mode            = 0;
+int waiter                         = 0;
 static float dB_Threshold_Value_Start;
 static float dB_Threshold_Value_Middle;
 static float dB_Threshold_Value_End;
@@ -56,6 +57,7 @@ static void silenceremover_wavedata_listener( void *ctx, ddb_audio_data_t *data 
 {
     float percent = deadbeef->playback_get_pos();
     if (percent <= 0.0) return;
+    waiter += 1;
 
     deadbeef->mutex_lock( mutex );
 
@@ -89,8 +91,9 @@ static void silenceremover_wavedata_listener( void *ctx, ddb_audio_data_t *data 
     if ( dB > dB_Threshold_Value_Start ) scan_start_blocked = TRUE;
 
     // Fast forward from the beginning until reaching of the threshold value
-    if ( dB_Threshold_Value_Start >= 0 && !scan_start_blocked && percent < 10.0 )
+    if ( dB_Threshold_Value_Start >= 0 && !scan_start_blocked && percent < 10.0 && waiter >= 6 )
     {
+        waiter = 0;
         deadbeef->playback_set_pos( percent + 0.05 );
         //printf( "++ Fast forward from the beginning: dB: %f / percent played: %f / play pos: %f / song length: %f\n", dB, percent, pos, length );
     }
@@ -108,8 +111,9 @@ static void silenceremover_wavedata_listener( void *ctx, ddb_audio_data_t *data 
         //printf( "-> Next song (%f seconds skipped): dB: %f / percent played: %f / play pos: %f / song length: %f\n\n", length - pos, dB, percent, pos, length );
     }
     // Skip very quiet places in the middle part of the song
-    else if ( dB_Threshold_Value_Middle >= 0 && dB <= dB_Threshold_Value_Middle && percent >= 10.0 && percent <= 90.0 )
+    else if ( dB_Threshold_Value_Middle >= 0 && dB <= dB_Threshold_Value_Middle && percent >= 10.0 && percent <= 90.0 && waiter >= 6 )
     {
+        waiter = 0;
         deadbeef->playback_set_pos( percent + 0.1 );
         //printf( "++ Fast forward: dB: %f / percent played: %f / play pos: %f / song length: %f\n", dB, percent, pos, length );
     }
