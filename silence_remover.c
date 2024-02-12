@@ -21,7 +21,8 @@
 #include <gtk/gtk.h>
 #include "deadbeef.h"
 #include "fastftoi.h"
-
+#include <stdio.h>
+#include <time.h>
 
 #define MAX_CHANNELS 2
 
@@ -37,7 +38,7 @@ static int pl_loop_mode            = 0;
 static float dB_Threshold_Value_Start;
 static float dB_Threshold_Value_Middle;
 static float dB_Threshold_Value_End;
-
+static clock_t previous            = 0;
 
 
 static void load_config(){
@@ -54,29 +55,39 @@ static void load_config(){
 
 static void silenceremover_wavedata_listener( void *ctx, ddb_audio_data_t *data )
 {
-    float percent = deadbeef->playback_get_pos();
-    if (percent <= 0.0) return;
+
+    const clock_t current = clock();
+    const double elapsed = (double)(current - previous) / CLOCKS_PER_SEC;
+
+    if ( elapsed < 0.02 ) return;  // Reduces CPU load
+
+    previous = current;
+    // printf("Check silence %f\n", elapsed);
+
+
+    const float percent = deadbeef->playback_get_pos();
+    if ( percent <= 0.0 ) return;
 
     deadbeef->mutex_lock( mutex );
 
     float result = 0;
-    int channels = MIN( MAX_CHANNELS, data->fmt->channels );
-    int nsamples = data->nframes / channels;
+    const int channels = MIN( MAX_CHANNELS, data->fmt->channels );
+    const int nsamples = data->nframes / channels;
 
-    for ( int channel = 0; channel < channels; channel++ )
+    for ( int channel = 0; channel < channels; ++channel )
     {
-        float sum = 0;
-        for ( int s = 0; s < nsamples + channel; s++ )
+        float sum = 0, amplitude = 0;
+        for ( int s = 0; s < nsamples + channel; ++s )
         {
-            float amplitude = data->data[ftoi( s * data->fmt->channels ) + channel];
+            amplitude = data->data[ftoi( s * data->fmt->channels ) + channel];
             sum += amplitude * amplitude;
         }
         result += ( sqrt( sum / nsamples ) );
     }
 
     result /= channels;
-    float dB = 100 + ( 20.0 * log10f (result) ); // 100 = DB_RANGE
-  
+    const float dB = 100 + ( 20.0 * log10f (result) ); // 100 = DB_RANGE
+
     // printf( "dB: %f / start_dB: %f    middle_dB: %f     end_dB: %f   percent played: %f\n", dB, dB_Threshold_Value_Start, dB_Threshold_Value_Middle, dB_Threshold_Value_End, percent );
 
     //DB_playItem_t *it = deadbeef->streamer_get_playing_track_safe();
@@ -91,7 +102,7 @@ static void silenceremover_wavedata_listener( void *ctx, ddb_audio_data_t *data 
     // Fast forward from the beginning until reaching of the threshold value
     if ( dB_Threshold_Value_Start >= 0 && !scan_start_blocked && percent < 10.0 )
     {
-        deadbeef->playback_set_pos( percent + 0.05 );
+        deadbeef->playback_set_pos( percent + 0.1 );
         //printf( "++ Fast forward from the beginning: dB: %f / percent played: %f / play pos: %f / song length: %f\n", dB, percent, pos, length );
     }
     // If the music gets too quiet towards the end of the song we jump to the next song
@@ -110,7 +121,7 @@ static void silenceremover_wavedata_listener( void *ctx, ddb_audio_data_t *data 
     // Skip very quiet places in the middle part of the song
     else if ( dB_Threshold_Value_Middle >= 0 && dB <= dB_Threshold_Value_Middle && percent >= 10.0 && percent <= 90.0 )
     {
-        deadbeef->playback_set_pos( percent + 0.1 );
+        deadbeef->playback_set_pos( percent + 1.0 );
         //printf( "++ Fast forward: dB: %f / percent played: %f / play pos: %f / song length: %f\n", dB, percent, pos, length );
     }
 
@@ -119,7 +130,7 @@ static void silenceremover_wavedata_listener( void *ctx, ddb_audio_data_t *data 
 
 static int silenceremover_connect( void )
 {
-    if (mutex == 0) mutex = deadbeef->mutex_create();
+    if ( mutex == 0 ) mutex = deadbeef->mutex_create();
     deadbeef->vis_waveform_listen( NULL, silenceremover_wavedata_listener );
 
     return 0;
@@ -152,7 +163,7 @@ static int handle_event( uint32_t current_event, uintptr_t ctx, uint32_t p1, uin
         scan_end_blocked   = FALSE;
     }
 
-    // Prevent songs from being skipped if DeaDBeeF switch to the next song itself 
+    // Prevent songs from being skipped if DeaDBeeF switch to the next song itself
     else if ( current_event == DB_EV_SONGCHANGED || current_event == DB_EV_SONGFINISHED )
     {
         scan_start_blocked = TRUE;
